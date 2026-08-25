@@ -244,9 +244,9 @@ def derive_C(R, f_char_hz):
 # STREAMLIT UI
 # ============================================================
 
-st.set_page_config(page_title="Si/SiC Pre-lithiation Optimizer", layout="wide")
+st.set_page_config(page_title="Si Pre-lithiation Optimizer", layout="wide")
 
-st.title("실리콘계 음극 프리리튬화 최적화")
+st.title("Si Anode Pre-lithiation Optimizer")
 st.caption("Based on Zhao 2025 [A] (anchor) · Li 2023 [B] (rate correction)")
 
 # ── Sidebar ──────────────────────────────────────────────────
