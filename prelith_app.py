@@ -349,22 +349,94 @@ if run_btn:
             "[A]/[B]에서 직접 디지타이징한 값이 아닙니다."
         )
 
+        R0 = res["R0"]
         R_SEI_for_c = res["RSEI"] if res["RSEI_valid"] else 0.0
+        Rct = res["Rct"]
         C_SEI = derive_C(R_SEI_for_c, F_SEI_CHAR_HZ) if R_SEI_for_c > 0 else 0.0
-        C_dl = derive_C(res["Rct"], F_CT_CHAR_HZ)
+        C_dl = derive_C(Rct, F_CT_CHAR_HZ)
 
-        freqs = np.logspace(5, -2, 160)  # 100 kHz -> 10 mHz
-        Z = randles_impedance(res["R0"], R_SEI_for_c, C_SEI, res["Rct"], C_dl, freqs)
+        freqs = np.logspace(5, -2, 400)  # 100 kHz -> 10 mHz, finer for a clean color split
+        Z = randles_impedance(R0, R_SEI_for_c, C_SEI, Rct, C_dl, freqs)
+
+        # The curve is really TWO semicircles in series (SEI arc, then charge-transfer
+        # arc) but when one resistance is much bigger than the other they visually
+        # blend into what looks like a single rounded arc. Color-split the SAME curve
+        # at the geometric-mean frequency between the two characteristic frequencies so
+        # a viewer can see which half of the curve each resistor is responsible for,
+        # and label each segment's real-axis width with its Ω value directly.
+        x0, x1, x2 = R0, R0 + R_SEI_for_c, R0 + R_SEI_for_c + Rct
+        apex = float(np.max(-Z.imag)) if len(Z) else 1.0
 
         fig_nyq = go.Figure()
-        fig_nyq.add_trace(go.Scatter(
-            x=Z.real, y=-Z.imag, mode="lines+markers",
-            marker=dict(size=4), line=dict(color="#7C3AED", width=2),
-            name="Z(f)"))
+
+        if R_SEI_for_c > 0:
+            f_split = np.sqrt(F_SEI_CHAR_HZ * F_CT_CHAR_HZ)
+            idx_split = int(np.clip(np.searchsorted(-freqs, -f_split), 1, len(freqs) - 1))
+            sei_sl, ct_sl = slice(0, idx_split + 1), slice(idx_split, None)  # share boundary point, no gap
+
+            # 위 ICE/R_SEI/Rct 3분할 그래프에서 R_SEI는 빨강(#DC2626), Rct는 초록(#16A34A)을
+            # 이미 쓰고 있음 — 새 색을 끌어오는 대신 앱 안에서 이미 통용되는 그 색을 그대로 재사용.
+            fig_nyq.add_trace(go.Scatter(
+                x=Z.real[sei_sl], y=-Z.imag[sei_sl], mode="lines+markers",
+                marker=dict(size=4), line=dict(color="#DC2626", width=3),
+                name=f"SEI 저항 성분 (R_SEI ≈ {R_SEI_for_c:.1f} Ω)",
+                customdata=freqs[sei_sl],
+                hovertemplate="f ≈ %{customdata:.3g} Hz<br>Z' = %{x:.2f} Ω<br>-Z'' = %{y:.2f} Ω<extra></extra>",
+            ))
+            fig_nyq.add_trace(go.Scatter(
+                x=Z.real[ct_sl], y=-Z.imag[ct_sl], mode="lines+markers",
+                marker=dict(size=4), line=dict(color="#16A34A", width=3),
+                name=f"전하이동 저항 성분 (R_ct ≈ {Rct:.1f} Ω)",
+                customdata=freqs[ct_sl],
+                hovertemplate="f ≈ %{customdata:.3g} Hz<br>Z' = %{x:.2f} Ω<br>-Z'' = %{y:.2f} Ω<extra></extra>",
+            ))
+        else:
+            fig_nyq.add_trace(go.Scatter(
+                x=Z.real, y=-Z.imag, mode="lines+markers",
+                marker=dict(size=4), line=dict(color="#16A34A", width=3),
+                name=f"전하이동 저항 성분 (R_ct ≈ {Rct:.1f} Ω)",
+                customdata=freqs,
+                hovertemplate="f ≈ %{customdata:.3g} Hz<br>Z' = %{x:.2f} Ω<br>-Z'' = %{y:.2f} Ω<extra></extra>",
+            ))
+
+        # dotted guide lines + inline Ω labels at each segment's real-axis boundary
+        for xv in ([x0, x1, x2] if R_SEI_for_c > 0 else [x0, x2]):
+            fig_nyq.add_vline(x=xv, line_dash="dot", line_color="#9CA3AF", line_width=1)
+
+        label_y = apex * 0.06
+        if R_SEI_for_c > 0:
+            fig_nyq.add_annotation(x=(x0 + x1) / 2, y=label_y, text=f"R_SEI ≈ {R_SEI_for_c:.1f} Ω",
+                                    showarrow=False, bgcolor="rgba(255,255,255,0.85)",
+                                    font=dict(size=12, color="#DC2626"))
+            fig_nyq.add_annotation(x=(x1 + x2) / 2, y=label_y, text=f"R_ct ≈ {Rct:.1f} Ω",
+                                    showarrow=False, bgcolor="rgba(255,255,255,0.85)",
+                                    font=dict(size=12, color="#16A34A"))
+        else:
+            fig_nyq.add_annotation(x=(x0 + x2) / 2, y=label_y, text=f"R_ct ≈ {Rct:.1f} Ω",
+                                    showarrow=False, bgcolor="rgba(255,255,255,0.85)",
+                                    font=dict(size=12, color="#16A34A"))
+        fig_nyq.add_annotation(x=x0, y=apex * 0.22, text=f"R0 ≈ {R0:.1f} Ω",
+                                showarrow=True, arrowhead=2, ax=-40, ay=-30,
+                                bgcolor="rgba(255,255,255,0.85)", font=dict(size=11, color="#374151"))
+
         fig_nyq.update_xaxes(title_text="Z' [Ω]")
-        fig_nyq.update_yaxes(title_text="-Z'' [Ω]", scaleanchor="x", scaleratio=1)
-        fig_nyq.update_layout(height=420, showlegend=False, margin=dict(t=20, b=30))
+        fig_nyq.update_yaxes(title_text="-Z'' [Ω]", scaleanchor="x", scaleratio=1,
+                              range=[-apex * 0.1, apex * 1.15])
+        fig_nyq.update_layout(
+            height=460,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+            margin=dict(t=20, b=30),
+        )
         st.plotly_chart(fig_nyq, use_container_width=True)
+
+        st.caption(
+            "**읽는 법** — 반원의 가로 폭이 곧 그 저항 성분의 크기입니다. "
+            f"원점 → 첫 지점({R0:.1f} Ω)은 배선·접촉 저항 R0, "
+            + (f"빨간색 구간의 폭({R_SEI_for_c:.1f} Ω)은 SEI 저항, " if R_SEI_for_c > 0 else "")
+            + f"초록색 구간의 폭({Rct:.1f} Ω)은 전하이동 저항입니다 (위 R_SEI·Rct 그래프와 같은 색). "
+            + ("두 반원이 이어 붙어 하나처럼 보이지만, 실제로는 직렬로 연결된 두 개의 서로 다른 저항 성분입니다."
+               if R_SEI_for_c > 0 else "")
+        )
 
         ncol1, ncol2 = st.columns(2)
         ncol1.metric("C_SEI (역산)", f"{C_SEI*1e6:.2f} µF" if C_SEI > 0 else "N/A")
