@@ -278,8 +278,14 @@ with st.sidebar:
 
     C_rate_input = st.number_input(
         "C-rate  (0.02 – 0.10)",
-        min_value=0.02, max_value=0.10,
+        min_value=0.019, max_value=0.101,
         value=0.05, step=0.01, format="%.3f")
+    # 0.03 - 0.01 등은 이진 부동소수점으로 정확히 0.02가 아니라
+    # 0.019999999999999997이 되어, min_value=0.02와 같으면 그 값이
+    # "범위 밖"으로 판정되어 −버튼이 0.02에 도달하기 직전에 멈춰버림.
+    # min/max를 한 스텝 폭 안에서 살짝 넓혀 그 경계 판정을 피하고,
+    # 계산에 쓰는 값은 다시 소수 3자리로 반올림해 깨끗하게 만든다.
+    C_rate_input = round(C_rate_input, 3)
 
     mode_input = st.radio("Mode", ["Continuous", "Pulse"])
 
