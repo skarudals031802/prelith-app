@@ -81,6 +81,24 @@ w_RSEI = 0.5
 ICE_overPL_threshold = 100.0
 
 # ------------------------------------------------------------
+# DUTY-CYCLE FACTORS — EXPLORATORY, OFF BY DEFAULT
+#
+# params_prelithiation.m 4절과 같은 배열이다. 논문 그림에서 digitize한
+# 값이 아니라, 일반 펄스 충전 문헌 [C]의 정성적 경향(휴지 구간이 있으면
+# 표면 Li 농도구배가 완화되어 국부 과전압이 낮아지고, 그 결과 전해액
+# 환원이 덜 일어나 SEI가 더 얇고 균일해진다)을 숫자로 옮겨 적은
+# 플레이스홀더다. Si 프리리튬화의 pulse-vs-continuous 실측 데이터는
+# 아직 없으므로 기본 가정 강도는 0 (= 보정 없음)이다.
+#
+# 실측이 생기면 이 네 줄만 교체하고 기본 가정 강도를 1.0으로 올리면 된다.
+# ------------------------------------------------------------
+DUTY_BP     = np.array([0.10, 0.25, 0.50, 0.75, 1.00])
+F_DUTY_RSEI = np.array([0.90, 0.83, 0.86, 0.93, 1.00])
+F_DUTY_RCT  = np.array([0.95, 0.91, 0.93, 0.97, 1.00])
+F_DUTY_ICE  = np.array([1.014, 1.020, 1.017, 1.009, 1.000])
+DUTY_CONF   = "Low"
+
+# ------------------------------------------------------------
 # Nyquist / Randles circuit — EXPLORATORY, NOT literature-digitized
 #
 # Neither params_Si_prelithiation.m nor the original Simulink build
@@ -116,7 +134,22 @@ def interp_clip(x, xp, fp):
     return float(np.interp(x, xp, fp, left=fp[0], right=fp[-1]))
 
 
-def simulate(preset, C_rate, pl_mode, t_on, t_off, Q_tgt):
+def duty_factor(duty, arr, belief):
+    """
+    펄스 이득 가정을 belief(0~1)만큼만 인정한 duty 보정계수.
+
+    belief = 0  -> 1.0        (보정 없음. 지금까지의 기본 동작)
+    belief = 1  -> arr 값 그대로 (params_prelithiation.m 4절 플레이스홀더)
+
+    실측 데이터가 아니므로 belief > 0 인 결과는 화면에서 '가정 포함'으로
+    표시된다.
+    """
+    if belief <= 0.0:
+        return 1.0
+    return 1.0 + belief * (interp_clip(duty, DUTY_BP, arr) - 1.0)
+
+
+def simulate(preset, C_rate, pl_mode, t_on, t_off, Q_tgt, duty_belief=0.0):
     """
     Returns dict with ICE, RSEI, Rct, R0, time_h, Q_PL,
     RSEI_valid, overPL at the moment Q_PL reaches Q_tgt.
@@ -133,6 +166,18 @@ def simulate(preset, C_rate, pl_mode, t_on, t_off, Q_tgt):
     f_ICE = interp_clip(C_rate, preset["C_rate_bp"], preset["f_rate_ICE"])
     f_RSEI = interp_clip(C_rate, preset["C_rate_bp"], preset["f_rate_RSEI"])
     f_Rct = 1.0  # rate -> Rct disabled in both presets
+
+    # duty 보정은 펄스 조건에만, 그리고 가정 강도만큼만 적용된다
+    if pl_mode == 1 and duty_belief > 0.0:
+        d_ICE = duty_factor(duty, F_DUTY_ICE, duty_belief)
+        d_RSEI = duty_factor(duty, F_DUTY_RSEI, duty_belief)
+        d_Rct = duty_factor(duty, F_DUTY_RCT, duty_belief)
+    else:
+        d_ICE = d_RSEI = d_Rct = 1.0
+
+    f_ICE *= d_ICE
+    f_RSEI *= d_RSEI
+    f_Rct *= d_Rct
 
     ICE_val = interp_clip(Q_tgt, preset["Q_PL_bp"], preset["ICE_base"]) * f_ICE
     Rct_val = interp_clip(Q_tgt, preset["Q_PL_bp"], preset["Rct_base"]) * f_Rct
@@ -160,6 +205,8 @@ def simulate(preset, C_rate, pl_mode, t_on, t_off, Q_tgt):
         "RSEI_is_extrapolated": RSEI_is_extrapolated,
         "overPL": ICE_val >= ICE_overPL_threshold,
         "duty": duty,
+        "duty_belief": duty_belief if pl_mode == 1 else 0.0,
+        "duty_applied": (pl_mode == 1 and duty_belief > 0.0),
     }
 
 
@@ -181,8 +228,19 @@ def get_curves(preset, C_rate, Q_target):
     return Q_arr, ICE_arr, Rct_arr, Q_rsei, RSEI_arr
 
 
-def sweep(preset, Q_target):
-    """Run 20-condition sweep. Returns list of result dicts."""
+def sweep(preset, Q_target, duty_belief=0.0, w_time=0.0):
+    """
+    20조건 스윕.
+
+    duty_belief : 펄스 이득 가정 강도 0~1. 0이면 펄스의 ICE/R_SEI/Rct는
+                  같은 C-rate의 연속 조건과 완전히 같은 값이 된다.
+    w_time      : 공정시간 가중치 0~1. 0이면 점수식이 기존과 동일하다.
+                  0보다 크면 품질 가중치가 (1-w_time)/2씩으로 재배분된다.
+
+    펄스 조건도 이제 점수를 받는다. duty_belief = 0 일 때 펄스의 점수는
+    같은 C-rate 연속 조건과 동점이 되는데, 이는 '펄스가 열등하다'가 아니라
+    '구분할 데이터가 아직 없다'는 뜻을 그대로 보여주는 것이다.
+    """
     C_list = [0.02, 0.05, 0.08, 0.10]
     t_on_s = [10 * 60, 10 * 60, 20 * 60, 30 * 60]
     t_off_s = [60 * 60, 30 * 60, 20 * 60, 10 * 60]
@@ -201,7 +259,7 @@ def sweep(preset, Q_target):
 
     for cr in C_list:
         for ton, toff in zip(t_on_s, t_off_s):
-            r = simulate(preset, cr, 1, ton, toff, Q_target)
+            r = simulate(preset, cr, 1, ton, toff, Q_target, duty_belief=duty_belief)
             r["label"] = f"{cr:.2f}C pulse {ton // 60}/{toff // 60}min"
             r["C_rate"] = cr
             r["mode"] = "Pulse"
@@ -210,20 +268,60 @@ def sweep(preset, Q_target):
             r["support"] = "Exploratory"
             rows.append(r)
 
+    # ── 정규화 기준 ────────────────────────────────────────────
+    # ICE / R_SEI 는 지금까지와 똑같이 '연속 조건 4개'의 범위로만 정규화한다.
+    # 그래야 기존에 발표한 연속 조건 점수(0.8566 / 0.8500 / 0.3643 / 0.2000)가
+    # 그대로 재현되고, 펄스는 그 자와 비교되는 형태가 된다.
     core = [r for r in rows if r["mode"] == "Continuous" and r["RSEI_valid"]]
-    ICE_vals = [r["ICE"] for r in core]
-    RSEI_vals = [r["RSEI"] for r in core]
+    ICE_min, ICE_max = min(c["ICE"] for c in core), max(c["ICE"] for c in core)
+    RSEI_min, RSEI_max = min(c["RSEI"] for c in core), max(c["RSEI"] for c in core)
 
-    ICE_min, ICE_max = min(ICE_vals), max(ICE_vals)
-    RSEI_min, RSEI_max = min(RSEI_vals), max(RSEI_vals)
+    # 공정시간은 가정이 아니라 정의(t = Q / (duty·C·Q_ref))이므로
+    # 순위에 들어가는 모든 조건의 실제 범위로 정규화한다. 폭이 6.99h ~ 293h로
+    # 매우 넓어 로그 스케일을 쓴다.
+    ranked = [r for r in rows if r["RSEI_valid"]]
+    lt = [np.log(r["time_h"]) for r in ranked]
+    lt_min, lt_max = min(lt), max(lt)
+
+    wT = float(np.clip(w_time, 0.0, 1.0))
+    wI = wR = (1.0 - wT) / 2.0
 
     for r in rows:
-        if not r["RSEI_valid"] or r["mode"] == "Pulse":
+        if not r["RSEI_valid"]:
             r["score"] = float("nan")
+            r["s_ice"] = r["s_rsei"] = r["s_time"] = float("nan")
             continue
-        s_ice = (r["ICE"] - ICE_min) / (ICE_max - ICE_min) if ICE_max > ICE_min else 1.0
-        s_rsei = (RSEI_max - r["RSEI"]) / (RSEI_max - RSEI_min) if RSEI_max > RSEI_min else 1.0
-        r["score"] = w_ICE * s_ice + w_RSEI * s_rsei
+        r["s_ice"] = (r["ICE"] - ICE_min) / (ICE_max - ICE_min) if ICE_max > ICE_min else 1.0
+        r["s_rsei"] = (RSEI_max - r["RSEI"]) / (RSEI_max - RSEI_min) if RSEI_max > RSEI_min else 1.0
+        r["s_time"] = ((lt_max - np.log(r["time_h"])) / (lt_max - lt_min)) if lt_max > lt_min else 1.0
+        r["score"] = wI * r["s_ice"] + wR * r["s_rsei"] + wT * r["s_time"]
+
+    # ── 손익분기: 가정 없이도 펄스 행을 읽을 수 있게 만드는 값 ──────
+    # "같은 공정시간 안에 돌릴 수 있는 최선의 연속 조건"을 이기려면
+    # ICE를 몇 %p 올리거나 R_SEI를 몇 % 낮춰야 하는가. 순수한 역산이라
+    # 어떤 가정도 들어가지 않는다.
+    conts = [r for r in rows if r["mode"] == "Continuous" and r["RSEI_valid"]]
+    for r in rows:
+        r["be"] = None
+        if r["mode"] != "Pulse" or not r["RSEI_valid"]:
+            continue
+        elig = [c for c in conts if c["time_h"] <= r["time_h"] + 1e-9]
+        if not elig:
+            continue
+        rival = max(elig, key=lambda c: c["score"])
+        be = {"rival": rival["label"],
+              "rival_time_h": rival["time_h"],
+              "extra_h": r["time_h"] - rival["time_h"]}
+        gap = rival["score"] - r["score"]
+        be["gap"] = gap
+        if wI > 0 and ICE_max > ICE_min:
+            s_need = (rival["score"] - wR * r["s_rsei"] - wT * r["s_time"]) / wI
+            be["d_ice_pp"] = max(0.0, ICE_min + s_need * (ICE_max - ICE_min) - r["ICE"])
+        if wR > 0 and RSEI_max > RSEI_min and r["RSEI"] > 0:
+            s_need = (rival["score"] - wI * r["s_ice"] - wT * r["s_time"]) / wR
+            need = RSEI_max - s_need * (RSEI_max - RSEI_min)
+            be["d_rsei_pct"] = max(0.0, (1.0 - need / r["RSEI"]) * 100.0)
+        r["be"] = be
 
     return rows
 
@@ -298,6 +396,26 @@ with st.sidebar:
 
     show_nyquist = st.checkbox("Nyquist(EIS) 곡선 보기 — 탐색적", value=False)
 
+    st.divider()
+    with st.expander("순위 기준 (Ranking)", expanded=False):
+        w_time_pct = st.slider(
+            "공정시간 가중치", 0, 60, 0, step=5, format="%d %%",
+            help="0 %면 지금까지와 같은 점수식(ICE 50 : R_SEI 50)입니다. "
+                 "올리면 그만큼 품질 가중치가 줄고 공정시간이 순위에 반영됩니다. "
+                 "시간은 t = Q /(duty·C·Q_ref)로 정확히 계산되는 값이라 "
+                 "여기에는 아무 가정도 들어가지 않습니다.",
+        )
+        duty_belief_pct = st.slider(
+            "펄스 이득 가정", 0, 100, 0, step=5, format="%d %%",
+            help="펄스의 휴지 구간이 SEI를 더 얇고 균일하게 만든다는 효과를 "
+                 "어느 정도로 인정할지 정합니다. 0 %면 보정 없음(현재 기본값), "
+                 "100 %면 params_prelithiation.m 4절의 duty 플레이스홀더를 "
+                 "그대로 적용합니다. Si 프리리튬화의 실측 pulse-vs-continuous "
+                 "데이터는 아직 없으므로, 0 %보다 크게 두면 결과는 '가정 포함'입니다.",
+        )
+    w_time_input = w_time_pct / 100.0
+    duty_belief_input = duty_belief_pct / 100.0
+
     run_btn = st.button("▶  Run", use_container_width=True)
     sweep_btn = st.button("⟳  Sweep (20 conditions)", use_container_width=True)
 
@@ -306,10 +424,24 @@ if run_btn:
     pl_mode = 1 if mode_input == "Pulse" else 0
     res = simulate(preset, C_rate_input, pl_mode,
                    t_on_input * 60, t_off_input * 60,
-                   Q_tgt=Q_tgt_input)
+                   Q_tgt=Q_tgt_input, duty_belief=duty_belief_input)
 
     if res["RSEI_is_extrapolated"]:
         st.info("R_SEI 값은 Q_PL = 0에서 외삽된 값입니다 (실측 아님).")
+
+    if res["duty_applied"]:
+        st.warning(
+            f"**가정 포함 결과** — 펄스 이득 가정 {duty_belief_pct} % 적용 "
+            f"(duty {res['duty']:.3f}). 이 보정은 Si 프리리튬화 실측이 아니라 "
+            f"일반 펄스 충전 문헌의 정성적 경향을 옮겨 적은 플레이스홀더입니다 "
+            f"(신뢰도 {DUTY_CONF}). 문헌 지지 값을 보려면 가정을 0 %로 두세요."
+        )
+    elif pl_mode == 1:
+        st.info(
+            "펄스 보정이 꺼져 있어(가정 0 %) ICE·R_SEI·Rct는 같은 C-rate의 "
+            "연속 조건과 같은 값입니다. 달라지는 것은 공정시간뿐입니다 — "
+            "펄스가 열등하다는 뜻이 아니라, 아직 구분할 실측 데이터가 없다는 뜻입니다."
+        )
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("ICE", f"{res['ICE']:.2f} %",
@@ -445,11 +577,47 @@ if run_btn:
 # ── Sweep ─────────────────────────────────────────────────────
 if sweep_btn:
     with st.spinner("Running 20 conditions..."):
-        rows = sweep(preset, Q_tgt_input)
+        rows = sweep(preset, Q_tgt_input,
+                     duty_belief=duty_belief_input, w_time=w_time_input)
 
-    st.subheader("Sweep Results  (sorted by score, continuous only ranked)")
+    wT = w_time_input
+    wq = (1.0 - wT) / 2.0
+    st.subheader("Sweep Results  (20 conditions, pulse included in ranking)")
+    st.caption(
+        f"점수식: ICE {wq*100:.0f} : R_SEI {wq*100:.0f} : 공정시간 {wT*100:.0f} "
+        f"· 펄스 이득 가정 {duty_belief_pct} % "
+        + ("· **가정 포함 결과**" if duty_belief_pct > 0 else "· 문헌 지지 값만 사용")
+    )
+
+    if duty_belief_pct > 0:
+        st.warning(
+            f"펄스 행에 duty 보정이 {duty_belief_pct} % 강도로 적용되어 있습니다. "
+            f"이 보정계수는 Si 프리리튬화 실측이 아니라 플레이스홀더입니다 "
+            f"(신뢰도 {DUTY_CONF}). 아래 순위는 '이 정도 효과가 실제로 있다면' 이라는 "
+            f"조건부 결과로만 읽어야 합니다."
+        )
+    else:
+        st.info(
+            "펄스 이득 가정이 0 %이므로 펄스의 ICE·R_SEI는 같은 C-rate 연속 조건과 "
+            "같은 값입니다. 그래서 펄스는 동점으로 나오며, 이는 열등하다는 뜻이 아니라 "
+            "구분할 실측 데이터가 아직 없다는 뜻입니다. 오른쪽 두 열은 "
+            "'같은 시간 안에 돌릴 수 있는 최선의 연속 조건을 이기려면 얼마나 좋아져야 하는가'를 "
+            "가정 없이 역산한 값입니다."
+        )
 
     import pandas as pd
+    rows_sorted = sorted(
+        rows, key=lambda r: (-r["score"] if not np.isnan(r["score"]) else 1e9))
+
+    def _be(r, key, fmt):
+        if r["mode"] != "Pulse" or not r.get("be") or key not in r["be"]:
+            return "—"
+        if abs(r["be"]["gap"]) < 1e-9:
+            return "동점"
+        if r["be"]["gap"] < 0:
+            return "이미 우세"
+        return fmt.format(r["be"][key])
+
     df = pd.DataFrame([{
         "Condition": r["label"],
         "Support": r["support"],
@@ -463,22 +631,55 @@ if sweep_btn:
         "R_SEI [Ω]": f"{r['RSEI']:.2f}" if r["RSEI_valid"] else "N/A",
         "Rct [Ω]": f"{r['Rct']:.2f}",
         "Score": f"{r['score']:.4f}" if not np.isnan(r["score"]) else "—",
+        "이기려면 ICE [%p]": _be(r, "d_ice_pp", "{:+.2f}"),
+        "이기려면 R_SEI ↓ [%]": _be(r, "d_rsei_pct", "{:.1f}"),
+        "비교 대상": (r["be"]["rival"] if r["mode"] == "Pulse" and r.get("be") else "—"),
         "OverPL": "⚠" if r["overPL"] else "",
-    } for r in rows])
+    } for r in rows_sorted])
 
     st.dataframe(df, use_container_width=True, height=420)
 
-    core_rows = [r for r in rows
-                 if r["mode"] == "Continuous"
-                 and r["RSEI_valid"]
-                 and not r["overPL"]
-                 and not np.isnan(r["score"])]
-    if core_rows:
-        best = max(core_rows, key=lambda r: r["score"])
+    ranked = [r for r in rows
+              if r["RSEI_valid"] and not r["overPL"] and not np.isnan(r["score"])]
+    if ranked:
+        # 동점이면 문헌 지지 조건(연속)을, 그래도 같으면 짧은 쪽을 택한다
+        best = max(ranked, key=lambda r: (round(r["score"], 9),
+                                          r["mode"] == "Continuous",
+                                          -r["time_h"]))
+        tag = "  ·  ⚠ 가정 포함" if best["mode"] == "Pulse" and duty_belief_pct > 0 else ""
         st.success(f"✅ Best condition: **{best['label']}**  |  "
                    f"ICE = {best['ICE']:.2f}%  |  "
                    f"R_SEI = {best['RSEI']:.2f} Ω  |  "
-                   f"Score = {best['score']:.4f}")
+                   f"Time = {best['time_h']:.2f} h  |  "
+                   f"Score = {best['score']:.4f}{tag}")
+
+        core_only = [r for r in ranked if r["mode"] == "Continuous"]
+        if core_only:
+            bc = max(core_only, key=lambda r: r["score"])
+            if bc["label"] != best["label"]:
+                st.caption(f"문헌 지지 조건(연속)만 볼 때의 1위: **{bc['label']}** "
+                           f"(Score {bc['score']:.4f}, {bc['time_h']:.2f} h)")
+
+    # 실험 우선순위 — 가정 없이 계산되는 값만 사용
+    cand = [r for r in rows
+            if r["mode"] == "Pulse" and r.get("be") and "d_ice_pp" in r["be"]
+            and r["be"]["gap"] > 0]
+    if cand:
+        # 실험을 실제로 돌릴 수 있느냐(추가 시간)가 먼저고,
+        # 그 다음이 판가름 나기 쉬우냐(필요 효과 크기)다.
+        cand.sort(key=lambda r: (r["be"]["extra_h"], r["be"]["d_ice_pp"]))
+        top = cand[:3]
+        lines = " · ".join(
+            f"**{r['label']}** (추가 {r['be']['extra_h']:.2f} h, "
+            f"ICE +{r['be']['d_ice_pp']:.2f} %p면 역전)" for r in top)
+        st.markdown(f"🔬 **먼저 측정할 펄스 조건** — {lines}")
+        st.caption("추가 공정시간이 적은 순, 같으면 역전에 필요한 효과가 작은 순입니다. "
+                   "가정이 아니라 역산 값이라 실험 계획에 그대로 쓸 수 있습니다.")
+
+    if any((not np.isnan(r["score"])) and r["score"] > 1.0 for r in rows):
+        st.caption("※ 점수가 1을 넘는 행이 있습니다 — 정규화 기준이 연속 조건 4개의 "
+                   "범위라서, 그 범위를 벗어나면 1을 초과합니다. 오류가 아니라 "
+                   "'문헌으로 확인된 구간 밖'이라는 표시입니다.")
 
     cont = sorted([r for r in rows if r["mode"] == "Continuous"], key=lambda r: r["C_rate"])
     cr_vals = [r["C_rate"] for r in cont]
